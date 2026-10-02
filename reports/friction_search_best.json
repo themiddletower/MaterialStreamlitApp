@@ -1,0 +1,10 @@
+{
+  "candidate": 7,
+  "r2": 0.3653965323859082,
+  "mae": 0.013083117197579923,
+  "mape_percent": 3.780486964521415,
+  "family": "ridge",
+  "features": "base",
+  "interactions": true,
+  "alpha": 0.01
+}

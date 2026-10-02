@@ -1,0 +1,119 @@
+{
+  "folds": [
+    {
+      "test_concentration": 15.0,
+      "train_groups": 12,
+      "test_groups": 3,
+      "train_concentrations": [
+        10.0,
+        10.0,
+        10.0,
+        20.0,
+        20.0,
+        20.0,
+        25.0,
+        25.0,
+        25.0,
+        30.0,
+        30.0,
+        30.0
+      ]
+    },
+    {
+      "test_concentration": 20.0,
+      "train_groups": 12,
+      "test_groups": 3,
+      "train_concentrations": [
+        10.0,
+        10.0,
+        10.0,
+        15.0,
+        15.0,
+        15.0,
+        25.0,
+        25.0,
+        25.0,
+        30.0,
+        30.0,
+        30.0
+      ]
+    },
+    {
+      "test_concentration": 25.0,
+      "train_groups": 12,
+      "test_groups": 3,
+      "train_concentrations": [
+        10.0,
+        10.0,
+        10.0,
+        15.0,
+        15.0,
+        15.0,
+        20.0,
+        20.0,
+        20.0,
+        30.0,
+        30.0,
+        30.0
+      ]
+    }
+  ],
+  "selected": [
+    "rbf",
+    "matern",
+    "matern",
+    "ridge_interactions",
+    "rbf"
+  ],
+  "convergence": [
+    {
+      "fold": 15.0,
+      "success": true,
+      "message": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH"
+    },
+    {
+      "fold": 20.0,
+      "success": true,
+      "message": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH"
+    },
+    {
+      "fold": 25.0,
+      "success": true,
+      "message": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH"
+    }
+  ],
+  "warnings": [
+    "The optimal value found for dimension 0 of parameter k1__k2__length_scale is close to the specified lower bound 0.05. Decreasing the bound and calling fit again may find a better value.",
+    "The optimal value found for dimension 0 of parameter k2__k1__constant_value is close to the specified lower bound 0.001. Decreasing the bound and calling fit again may find a better value.",
+    "The optimal value found for dimension 0 of parameter k2__k2__sigma_0 is close to the specified lower bound 0.001. Decreasing the bound and calling fit again may find a better value.",
+    "The optimal value found for dimension 1 of parameter k1__k2__length_scale is close to the specified lower bound 0.05. Decreasing the bound and calling fit again may find a better value.",
+    "The optimal value found for dimension 1 of parameter k1__k2__length_scale is close to the specified upper bound 100.0. Increasing the bound and calling fit again may find a better value.",
+    "The optimal value found for dimension 2 of parameter k1__k2__length_scale is close to the specified lower bound 0.05. Decreasing the bound and calling fit again may find a better value.",
+    "pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81."
+  ],
+  "seed": 42,
+  "source_sha256": "084ce180787f0896d210e88ea7747d66e994ef14e8eb439bf09c3a364c6ec789",
+  "sklearn_version": "1.8.0",
+  "protocol": "Leave one internal concentration out across all methods; 10 and 30 always train; scalers fit inside each fold; score group means; select by MAE; not independent final-test metrics.",
+  "base_selected": [
+    "rbf",
+    "matern",
+    "matern",
+    "matern",
+    "rbf"
+  ],
+  "friction_refinement": {
+    "config": {
+      "family": "ridge",
+      "features": "base",
+      "interactions": true,
+      "alpha": 0.01
+    },
+    "metrics": {
+      "r2": 0.3653965323859082,
+      "mae": 0.013083117197579923,
+      "mape_percent": 3.780486964521415
+    },
+    "protocol": "Same 15/20/25 concentration folds; hyperparameter-selection scores, not independent test results."
+  }
+}

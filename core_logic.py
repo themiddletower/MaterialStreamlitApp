@@ -1,244 +1,172 @@
+"""Inference and inverse design for CNT and carbon fiber."""
+import os
+os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '-1')
+
+import joblib
 import numpy as np
 import pandas as pd
-import joblib
-import tensorflow as tf
-import gpflow
-import os
 from scipy.optimize import minimize_scalar
-# import openpy
+from materials import ROOT, PROPERTIES, material_spec
 
-# Скрываем мусор от TensorFlow
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 def apply_fe(pct_arr, is_stat_arr, is_uv_arr, version):
-    """
-    Генерация признаков. 
-    ВНИМАНИЕ: Формулы строго синхронизированы с кодом обучения.
-    """
     base = np.column_stack([pct_arr, is_stat_arr, is_uv_arr])
-    pct_col = pct_arr.reshape(-1, 1)
-    # Добавляем крошечный эпсилон, чтобы не было деления на 0 при 0% УНТ
-    eps = 0.001 
-
-    if version == 'base': 
+    c = np.asarray(pct_arr).reshape(-1, 1)
+    if version == 'base':
         return base
-    if version == 'log_only': 
-        return np.hstack([base, np.log(pct_col + 0.1)])
-    if version == 'inv_only': 
-        return np.hstack([base, 1.0 / (pct_col + 0.1)**2])
-    if version == 'full': 
-        return np.hstack([
-            base, 
-            np.log(pct_col + 0.1), 
-            1.0 / (pct_col + eps)**2, 
-            np.sin(pct_col)
-        ])
+    if version == 'log_only':
+        return np.hstack([base, np.log(c + .1)])
+    if version == 'inv_only':
+        return np.hstack([base, 1 / (c + .1)**2])
+    if version == 'full':
+        # Retain the deployed transform exactly for the original CNT weights.
+        return np.hstack([base, np.log(c + .1), 1 / (c + .001)**2, np.sin(c)])
+    raise ValueError(f'Неизвестное преобразование признаков: {version}')
 
-def load_hybrid_system():
-    """Загрузка моделей и РЕКОНСТРУКЦИЯ данных для GPflow"""
-    base_path = "model_package"
-    meta = joblib.load(f"{base_path}/metadata.pkl")
-    sc_y = joblib.load(f'{base_path}/scaler_y.pkl')
-    scaler_x_gp = joblib.load(f'{base_path}/scaler_x_gp.pkl')
-    
-    # --- ОБНОВЛЯЕМ ИНДЕКСЫ ---
-    # Переносим индекс 2 (Упругость) из SK в GP
-    if 2 in meta['sk_indices']:
-        meta['sk_indices'].remove(2)
-    if 2 not in meta['gp_indices']:
-        meta['gp_indices'].append(2)
-    # -------------------------
 
-    models_sk = {}
-    scalers_x_sk = {}
+def load_hybrid_system(material_id='cnt'):
+    spec = material_spec(material_id)
+    if material_id == 'fiber':
+        from fiber_models import load_fiber
+        return load_fiber()
+    import tensorflow as tf
+    import gpflow
+    base = ROOT / 'model_package'
+    meta = joblib.load(base / 'metadata.pkl')
+    meta.update(sk_indices=[0, 1], gp_indices=[3, 4, 2], method_labels=spec['methods'])
+    sy = joblib.load(base / 'scaler_y.pkl')
+    sx = joblib.load(base / 'scaler_x_gp.pkl')
+    models = {k: joblib.load(base / f'sk_models/gpr_model_{k}.pkl') for k in meta['sk_indices']}
+    scalers = {k: joblib.load(base / f'sk_models/scaler_x_{k}.pkl') for k in meta['sk_indices']}
+    df = pd.read_excel(ROOT / 'raw_data_van.xlsx')
+    method_columns = ['Статическое', 'УЗ+100', 'Статическое с смешением в УВ']
+    df['method_code'] = df[method_columns].to_numpy().argmax(axis=1)
+    grouped = df.groupby(['% УНТ/ 99% ПТФЭ', 'method_code'])[PROPERTIES].mean()
+    y = grouped.to_numpy().copy()
+    y[:, meta['log_indices']] = np.log1p(y[:, meta['log_indices']])
+    ys = sy.transform(y)
+    c, m = grouped.index.get_level_values(0).to_numpy(), grouped.index.get_level_values(1).to_numpy()
+    xs = sx.transform(apply_fe(c, (m == 0).astype(float), (m == 2).astype(float), 'full'))
+    xa = np.vstack([np.column_stack([xs, np.full(len(xs), k)]) for k in meta['gp_indices']])
+    ya = np.vstack([ys[:, k:k+1] for k in meta['gp_indices']])
+    kernel = gpflow.kernels.Matern52(lengthscales=[1.] * 6, active_dims=list(range(6)))
+    kernel *= gpflow.kernels.Coregion(output_dim=5, rank=2, active_dims=[6])
+    model = gpflow.models.GPR((xa, ya), kernel=kernel)
+    latest = tf.train.latest_checkpoint(str(base / 'gpflow_weights'))
+    if not latest:
+        raise FileNotFoundError('Отсутствуют сохранённые веса GPflow для УНТ.')
+    status = tf.train.Checkpoint(model=model).restore(latest)
+    status.assert_existing_objects_matched()
+    status.expect_partial()
+    return dict(models_sk=models, scalers_x_sk=scalers, model_gp=model,
+                scaler_x_gp=sx, sc_y=sy, meta=meta, material_id=material_id,
+                training_means=grouped.to_numpy())
+
+
+def predict_batch(concentrations, method_idx, bundle):
+    spec = material_spec(bundle['material_id'])
+    c = np.atleast_1d(np.asarray(concentrations, dtype=float))
+    if c.ndim != 1 or not c.size or not np.isfinite(c).all():
+        raise ValueError('Концентрация должна быть конечным числом.')
+    low, high = spec['bounds']
+    if np.any((c < low) | (c > high)):
+        raise ValueError(f'Допустимая концентрация: {low:g}–{high:g}%.')
+    if isinstance(method_idx, bool) or not isinstance(method_idx, (int, np.integer)) or not 0 <= method_idx < len(spec['methods']):
+        raise ValueError('Недопустимый режим изготовления.')
+    if bundle['material_id'] == 'fiber':
+        from fiber_models import predict_fiber
+        return predict_fiber(bundle, c, method_idx)
+    meta, sy = bundle['meta'], bundle['sc_y']
+    a, b = np.full(len(c), float(method_idx == 0)), np.full(len(c), float(method_idx == 2))
+    mu, std = np.zeros((len(c), 5)), np.zeros((len(c), 5))
     for k in meta['sk_indices']:
-        models_sk[k] = joblib.load(f'{base_path}/sk_models/gpr_model_{k}.pkl')
-        scalers_x_sk[k] = joblib.load(f'{base_path}/sk_models/scaler_x_{k}.pkl')
-        
-    df = pd.read_excel("raw_data_van.xlsx")
-    method_ohe = ['Статическое', 'УЗ+100', 'Статическое с смешением в УВ']
-    df['method_code'] = df[method_ohe].values.argmax(axis=1)
-    grp = df.groupby(['% УНТ/ 99% ПТФЭ', 'method_code'])
-    
-    Y_raw = grp[meta['prop_cols']].mean().values
-    Y_trans = Y_raw.copy()
-    for idx in meta['log_indices']:
-        Y_trans[:, idx] = np.log1p(Y_trans[:, idx])
-    Y_sc_train = sc_y.transform(Y_trans)
-    
-    pct_vals = grp.mean().index.get_level_values(0).values
-    m_vals = grp.mean().index.get_level_values(1).values
-    is_stat = (m_vals == 0).astype(float)
-    is_uv = (m_vals == 2).astype(float)
-    
-    X_e_gp = apply_fe(pct_vals, is_stat, is_uv, 'full')
-    X_sc_gp_train = scaler_x_gp.transform(X_e_gp)
-    
-    # Генерируем аугментированные данные для ВСЕХ индексов, которые теперь в GP
-    X_aug_list, Y_aug_list = [], []
-    for j in meta['gp_indices']:
-        x_block = np.append(X_sc_gp_train, np.full((X_sc_gp_train.shape[0], 1), float(j)), axis=1)
-        y_block = Y_sc_train[:, j:j+1]
-        X_aug_list.append(x_block)
-        Y_aug_list.append(y_block)
-    
-    X_aug = np.vstack(X_aug_list)
-    Y_aug = np.vstack(Y_aug_list)
-    
-    num_feat_gp = X_e_gp.shape[1]
-    k_smooth = gpflow.kernels.Matern52(lengthscales=[1.0]*num_feat_gp, active_dims=list(range(num_feat_gp)))
-    # output_dim теперь должен соответствовать количеству целевых переменных в GP (или просто 5 для универсальности)
-    coreg = gpflow.kernels.Coregion(output_dim=5, rank=2, active_dims=[num_feat_gp])
-    
-    model_gp = gpflow.models.GPR(data=(X_aug, Y_aug), kernel=k_smooth * coreg)
-    
-    ckpt = tf.train.Checkpoint(model=model_gp)
-    latest = tf.train.latest_checkpoint(f'{base_path}/gpflow_weights/')
-    if latest:
-        ckpt.restore(latest).expect_partial()
-    
-    return {
-        'models_sk': models_sk,
-        'scalers_x_sk': scalers_x_sk,
-        'model_gp': model_gp,
-        'scaler_x_gp': scaler_x_gp,
-        'sc_y': sc_y,
-        'meta': meta
-    }
+        x = apply_fe(c, a, b, meta['sk_fe_versions'].get(k, 'base'))
+        means, sigmas = bundle['models_sk'][k].predict(bundle['scalers_x_sk'][k].transform(x), return_std=True)
+        mu[:, k], std[:, k] = means * sy.scale_[k] + sy.mean_[k], sigmas * sy.scale_[k]
+    x = bundle['scaler_x_gp'].transform(apply_fe(c, a, b, 'full'))
+    for k in meta['gp_indices']:
+        means, var = bundle['model_gp'].predict_y(np.column_stack([x, np.full(len(c), k)]))
+        mu[:, k] = means.numpy().ravel() * sy.scale_[k] + sy.mean_[k]
+        std[:, k] = np.sqrt(np.maximum(var.numpy().ravel(), 0)) * sy.scale_[k]
+    mu[:, meta['log_indices']] = np.expm1(mu[:, meta['log_indices']])
+    return mu, std
+
 
 def predict_hybrid(cnt, method_idx, bundle):
-    meta = bundle['meta']
-    sc_y = bundle['sc_y']
-    
-    m_vec = [1.0, 0.0] if method_idx == 0 else ([0.0, 1.0] if method_idx == 2 else [0.0, 0.0])
-    pct_arr = np.array([float(cnt)])
-    is_stat_arr, is_uv_arr = np.array([m_vec[0]]), np.array([m_vec[1]])
-    
-    preds, stds = np.zeros(5), np.zeros(5)
+    """Central predictions; std stays in log1p space for log outputs."""
+    mu, std = predict_batch([cnt], method_idx, bundle)
+    return mu[0], std[0]
 
-    # 1. Sklearn (Прочность, Удлинение)
-    for k in meta['sk_indices']:
-        fe_version = meta['sk_fe_versions'].get(k, 'base')
-        x_e = apply_fe(pct_arr, is_stat_arr, is_uv_arr, fe_version)
-        x_sc = bundle['scalers_x_sk'][k].transform(x_e)
-        mu_sc, std_sc = bundle['models_sk'][k].predict(x_sc, return_std=True)
-        
-        mu_orig = mu_sc[0] * sc_y.scale_[k] + sc_y.mean_[k]
-        std_orig = std_sc[0] * sc_y.scale_[k]
-        
-        preds[k] = np.expm1(mu_orig) if k in meta['log_indices'] else mu_orig
-        stds[k] = std_orig
 
-    # 2. GPflow (Упругость, Трение, Износ)
-    x_e_gp = apply_fe(pct_arr, is_stat_arr, is_uv_arr, 'full')
-    x_sc_gp = bundle['scaler_x_gp'].transform(x_e_gp)
-    
-    for k in meta['gp_indices']:
-        x_aug_gp = np.append(x_sc_gp, [[float(k)]], axis=1)
-        mu_sc_gp, var_sc_gp = bundle['model_gp'].predict_y(x_aug_gp)
-        
-        mu_orig = mu_sc_gp.numpy()[0, 0] * sc_y.scale_[k] + sc_y.mean_[k]
-        std_orig = np.sqrt(var_sc_gp.numpy()[0, 0]) * sc_y.scale_[k]
-        
-        preds[k] = np.expm1(mu_orig) if k in meta['log_indices'] else mu_orig
-        stds[k] = std_orig
+def prediction_intervals(predictions, std, bundle):
+    mu, sigma = np.asarray(predictions), np.asarray(std)
+    lower, upper = mu - 1.96 * sigma, mu + 1.96 * sigma
+    for k in bundle['meta']['log_indices']:
+        center = np.log1p(mu[..., k])
+        lower[..., k] = np.expm1(center - 1.96 * sigma[..., k])
+        upper[..., k] = np.expm1(center + 1.96 * sigma[..., k])
+    return lower, upper
 
-    return preds, stds
 
-# Функции инверсии и отрисовки используют predict_hybrid
+def scaled_targets(values, bundle):
+    y = np.array(values, dtype=float, copy=True)
+    y[..., bundle['meta']['log_indices']] = np.log1p(y[..., bundle['meta']['log_indices']])
+    return bundle['sc_y'].transform(np.atleast_2d(y))
+
+
 def solve_inverse_problem(target_dict, weights, bundle):
-    meta = bundle['meta']
-    sc_y = bundle['sc_y']
-    weights = np.array(weights)
-    
-    # 1. Подготовка целевого вектора в скалированном пространстве
-    y_target_vec = np.zeros(5)
-    for i, prop in enumerate(meta['prop_cols']):
-        val = target_dict.get(prop, 0.0)
-        y_target_vec[i] = np.log1p(val) if i in meta['log_indices'] else val
-    y_target_sc = sc_y.transform(y_target_vec.reshape(1, -1)).flatten()
-    
-    best_loss, best_cnt, best_m_idx = float('inf'), 1.0, 0
-    
-    # Извлекаем модели напрямую из бандла для быстрого доступа
-    models_sk = bundle['models_sk']
-    scalers_x_sk = bundle['scalers_x_sk']
-    model_gp = bundle['model_gp']
-    scaler_x_gp = bundle['scaler_x_gp']
-    
-    # 2. Оптимизация
-    for m_idx in [0, 1, 2]:
-        # Воспроизводим логику OHE-векторов из predict_hybrid
-        m_vec = [1.0, 0.0] if m_idx == 0 else ([0.0, 1.0] if m_idx == 2 else [0.0, 0.0])
-        
-        def objective(cnt):
-            pct_arr = np.array([float(cnt)])
-            is_stat_arr, is_uv_arr = np.array([m_vec[0]]), np.array([m_vec[1]])
-            
-            # Сюда соберем предикты всех 5 моделей в СКАЛИРОВАННОМ пространстве
-            mu_sc_outputs = np.zeros(5)
-            
-            # А. Предикт Sklearn-моделей (загоняем в нужное свойство k)
-            for k in meta['sk_indices']:
-                fe_version = meta['sk_fe_versions'].get(k, 'base')
-                x_e = apply_fe(pct_arr, is_stat_arr, is_uv_arr, fe_version)
-                x_sc = scalers_x_sk[k].transform(x_e)
-                # Берем "сырое" предсказание до денормализации
-                mu_sc_outputs[k] = models_sk[k].predict(x_sc)[0]
-                
-            # Б. Предикт GPflow-модели
-            x_e_gp = apply_fe(pct_arr, is_stat_arr, is_uv_arr, 'full')
-            x_sc_gp = scaler_x_gp.transform(x_e_gp)
-            
-            for k in meta['gp_indices']:
-                x_aug_gp = np.append(x_sc_gp, [[float(k)]], axis=1)
-                # КРИТИЧЕСКИ ДЛЯ СКОРОСТИ: используем predict_f вместо predict_y
-                mu_sc_gp, _ = model_gp.predict_f(x_aug_gp)
-                mu_sc_outputs[k] = mu_sc_gp.numpy()[0, 0]
-            
-            # Расчет MSE в нормированном пространстве без лишних трансформаций
-            return np.sum(weights * (mu_sc_outputs - y_target_sc)**2)
-            
-        res = minimize_scalar(objective, bounds=(1.0, 5.0), method='bounded')
-        
-        if res.fun < best_loss:
-            best_loss, best_cnt, best_m_idx = res.fun, res.x, m_idx
-            
-    # 3. Для самого лучшего рецепта один раз вызываем штатный денормализующий predict_hybrid
-    final_preds, _ = predict_hybrid(best_cnt, best_m_idx, bundle)
-    
-    return best_cnt, best_m_idx, final_preds
+    props = bundle['meta']['prop_cols']
+    if any(p not in target_dict for p in props):
+        raise ValueError('Задайте все пять целевых свойств.')
+    target = np.array([target_dict[p] for p in props], dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    if not np.isfinite(target).all() or np.any(target < 0):
+        raise ValueError('Цели должны быть конечными неотрицательными числами.')
+    if weights.shape != (5,) or not np.isfinite(weights).all() or np.any(weights < 0) or not np.any(weights > 0):
+        raise ValueError('Нужны пять неотрицательных весов; хотя бы один должен быть положительным.')
+    target_sc = scaled_targets(target, bundle)[0]
+    spec = material_spec(bundle['material_id'])
+    grid = np.linspace(*spec['bounds'], 101)
+    best = (np.inf, float(grid[0]), 0)
+    for method in range(len(spec['methods'])):
+        def objective(c):
+            values, _ = predict_hybrid(c, method, bundle)
+            return float(np.sum(weights * (scaled_targets(values, bundle)[0] - target_sc)**2))
+        values, _ = predict_batch(grid, method, bundle)
+        losses = np.sum(weights * (scaled_targets(values, bundle) - target_sc)**2, axis=1)
+        index = int(np.argmin(losses))
+        candidates = [(float(losses[index]), float(grid[index])),
+                      (float(losses[0]), float(grid[0])), (float(losses[-1]), float(grid[-1]))]
+        # Refine each sampled local basin and include the exact endpoints.
+        minima = np.flatnonzero((losses[1:-1] <= losses[:-2]) & (losses[1:-1] <= losses[2:])) + 1
+        for i in minima:
+            result = minimize_scalar(objective, bounds=(grid[i-1], grid[i+1]), method='bounded')
+            if result.success and np.isfinite(result.fun):
+                candidates.append((float(result.fun), float(result.x)))
+        loss, concentration = min(candidates)
+        best = min(best, (loss, concentration, method))
+    _, concentration, method = best
+    return concentration, method, predict_hybrid(concentration, method, bundle)[0]
+
 
 def get_plot_data(prop_idx, bundle):
-    pct_grid = np.linspace(1.0, 5.0, 100)
-    plot_results = {}
-    meta = bundle['meta']
-    
-    for m_idx, m_label in enumerate(meta['method_labels']):
-        preds_l, stds_l = [], []
-        for p in pct_grid:
-            mu, std = predict_hybrid(p, m_idx, bundle)
-            preds_l.append(mu[prop_idx])
-            stds_l.append(std[prop_idx])
-        
-        mu_arr = np.array(preds_l)
-        std_arr = np.array(stds_l)
-        
-        # Расчет интервалов
-        if prop_idx in meta['log_indices']:
-            
-            log_mu = np.log1p(mu_arr)
-            lower = np.expm1(log_mu - 2 * std_arr)
-            upper = np.expm1(log_mu + 2 * std_arr)
-        else:
-            # Обычный линейный случай
-            lower = mu_arr - 2 * std_arr
-            upper = mu_arr + 2 * std_arr
+    if prop_idx not in range(5):
+        raise ValueError('Неизвестное свойство.')
+    grid = np.linspace(*material_spec(bundle['material_id'])['bounds'], 100)
+    results = {}
+    for m, label in enumerate(bundle['meta']['method_labels']):
+        mu, std = predict_batch(grid, m, bundle)
+        lower, upper = prediction_intervals(mu, std, bundle)
+        results[label] = dict(x=grid, y=mu[:, prop_idx], lower=lower[:, prop_idx], upper=upper[:, prop_idx])
+    return results
 
-        plot_results[m_label] = {
-            'x': pct_grid, 
-            'y': mu_arr, 
-            'lower': lower, 
-            'upper': upper
-        }
-    return plot_results
+
+def experimental_means(material_id):
+    material_spec(material_id)
+    if material_id == 'fiber':
+        return pd.read_csv(ROOT / 'data/fiber_experiments.csv').groupby(['concentration', 'method'])[PROPERTIES].mean().reset_index()
+    df = pd.read_excel(ROOT / 'raw_data_van.xlsx')
+    df['method'] = df.iloc[:, 1:4].to_numpy().argmax(axis=1)
+    df['concentration'] = df.iloc[:, 0]
+    return df.groupby(['concentration', 'method'])[PROPERTIES].mean().reset_index()

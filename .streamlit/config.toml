@@ -1,0 +1,14 @@
+[theme]
+base = "light"
+primaryColor = "#007f88"
+textColor = "#20242b"
+
+[theme.sidebar]
+backgroundColor = "#f4f6f8"
+textColor = "#20242b"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = true
