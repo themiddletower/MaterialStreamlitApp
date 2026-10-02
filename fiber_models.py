@@ -2,7 +2,6 @@
 import os
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
 
-import hashlib
 import joblib
 import numpy as np
 import pandas as pd
@@ -11,6 +10,7 @@ from sklearn.gaussian_process.kernels import ConstantKernel, Matern, DotProduct,
 from sklearn.preprocessing import StandardScaler
 
 from materials import PROPERTIES, ROOT
+from data_integrity import matches_training_data
 
 LOG_INDICES = [2, 4]
 
@@ -99,8 +99,7 @@ def load_fiber():
     from materials import MATERIALS
     folder = ROOT / 'model_package' / 'fiber'
     info = joblib.load(folder / 'bundle.pkl')
-    current_hash = hashlib.sha256((ROOT / 'data/fiber_experiments.csv').read_bytes()).hexdigest()
-    if info['data_sha256'] != current_hash:
+    if not matches_training_data(ROOT / 'data/fiber_experiments.csv', info['data_sha256']):
         raise ValueError('Данные УВ изменены после обучения. Выполните python train_fiber.py.')
     if info['multi'] is not None:
         import gpflow

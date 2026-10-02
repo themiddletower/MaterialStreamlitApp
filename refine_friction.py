@@ -1,5 +1,4 @@
 """Install the selected smooth friction model without changing other properties."""
-import hashlib
 import json
 import joblib
 import numpy as np
@@ -9,13 +8,14 @@ from fiber_models import aggregate
 from friction_models import FRICTION_CONFIG, FRICTION_MODEL_NAME, fit_scalar, predict_scalar
 from materials import ROOT, PROPERTIES
 from tune_friction import evaluate
+from data_integrity import matches_training_data
 
 
 def install():
     data_path = ROOT / 'data/fiber_experiments.csv'
     package_path = ROOT / 'model_package/fiber/bundle.pkl'
     bundle = joblib.load(package_path)
-    if bundle['data_sha256'] != hashlib.sha256(data_path.read_bytes()).hexdigest():
+    if not matches_training_data(data_path, bundle['data_sha256']):
         raise ValueError('First retrain all fiber models with train_fiber.py.')
     x, y, noise, _ = aggregate(pd.read_csv(data_path))
     score, predictions = evaluate(FRICTION_CONFIG, x, y[:, 3], noise[:, 3])

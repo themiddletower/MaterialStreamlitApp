@@ -1,5 +1,4 @@
 """Train once, compare concentration-blocked interpolation folds, save artifacts."""
-import hashlib
 import json
 import warnings
 
@@ -12,6 +11,7 @@ from sklearn.metrics import mean_absolute_error, r2_score
 
 from fiber_models import aggregate, fit_candidate, predict_transformed, to_physical
 from materials import PROPERTIES, ROOT
+from data_integrity import data_digest
 
 
 def main():
@@ -49,7 +49,7 @@ def main():
                 candidates.append(row)
             selected.append(min(candidates, key=lambda row: row['mae'])['model'])
         final = dict(selected=selected, independent={}, multi=None,
-                     data_sha256=hashlib.sha256(data_path.read_bytes()).hexdigest(),
+                     data_sha256=data_digest(data_path),
                      sklearn_version=sklearn.__version__)
         for kind in sorted(set(selected)):
             print('FINAL', kind, flush=True)
